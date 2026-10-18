@@ -1,0 +1,8 @@
+__pycache__/
+*.py[cod]
+*$py.class
+*.session
+*.session-journal
+sessions.json
+.env
+.env.local

@@ -22,7 +22,7 @@ def update_env_file(key: str, value: str):
 
 def main():
     print("=" * 60)
-    print("🎬 Movie Max - Telegram One-Time Login Session Generator")
+    print("🎬 CineGram - Telegram One-Time Login Session Generator")
     print("=" * 60)
     print("This will connect to Telegram once to generate a StringSession.")
     print("The session string is saved in .env.local and will run headlessly.\n")
