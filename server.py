@@ -19,6 +19,7 @@ from telethon.tl.custom import Button
 
 token_message_cache: dict[str, int] = {}
 token_locks: dict[str, asyncio.Lock] = {}
+tgm_resolved_cache: dict[str, dict] = {}
 
 # Add current directory to sys.path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -314,6 +315,46 @@ async def auto_bypass_ad_gate(tg_client: TelegramClient, target_bot_entity, mess
 
     return False
 
+async def warmup_user_session(tg_client: TelegramClient, user_name: str = "User"):
+    """
+    Warms up the user session immediately upon login:
+    1. Sends /start to @TGM_Files_Bot, @HyperLinkGenXBot, and @phonofilmbot.
+    2. Sends a sample movie search ('Inception') to @TGM_Files_Bot.
+    3. If any bot demands joining channels (force-sub), auto-joins them immediately in the background.
+    This guarantees zero lag and no channel-join popups when the user searches for or plays a movie.
+    """
+    print(f"🔥 Starting background bot warm-up for user {user_name}...")
+    bots_to_start = [MOVIE_BOT, LINK_BOT, "phonofilmbot"]
+
+    for b in bots_to_start:
+        try:
+            bot_entity = await tg_client.get_input_entity(b)
+            print(f"📨 [Warmup] Sending /start to @{b}...")
+            sent = await tg_client.send_message(bot_entity, "/start")
+            await asyncio.sleep(1.0)
+            async for m in tg_client.iter_messages(bot_entity, limit=3):
+                if m.id >= sent.id:
+                    # Check for force-sub channel buttons
+                    await auto_handle_force_sub(tg_client, bot_entity, m)
+                    # Check for ad gate
+                    if any("clicked" in (btn.text or "").lower() or "flixdex" in (getattr(btn, "url", "") or "") for row in (m.buttons or []) for btn in row):
+                        await auto_bypass_ad_gate(tg_client, bot_entity, m)
+        except Exception as e:
+            print(f"⚠️ [Warmup] Error starting @{b}: {e}")
+
+    # Now send a sample search to @TGM_Files_Bot to verify and clear any force-sub gate
+    try:
+        tgm_entity = await tg_client.get_input_entity(MOVIE_BOT)
+        print(f"🔍 [Warmup] Sending sample search 'Inception' to @{MOVIE_BOT}...")
+        sample_sent = await tg_client.send_message(tgm_entity, "Inception")
+        await asyncio.sleep(1.5)
+        async for m in tg_client.iter_messages(tgm_entity, limit=3):
+            if m.id >= sample_sent.id:
+                await auto_handle_force_sub(tg_client, tgm_entity, m)
+        print(f"✅ [Warmup] Bot warm-up complete for {user_name}! Channels joined and ready.")
+    except Exception as e:
+        print(f"⚠️ [Warmup] Sample search error: {e}")
+
 @app.get("/auth/status")
 async def auth_status(request: Request, session: Optional[str] = Query(None)):
     session_id = session or request.headers.get("x-telegram-session")
@@ -425,6 +466,9 @@ async def auth_verify_code(req: VerifyCodeRequest):
 
     client = temp_client
     update_env_file("TELEGRAM_STRING_SESSION", session_str)
+
+    # Automatically warm up bots & join required channels in background
+    asyncio.create_task(warmup_user_session(temp_client, me.first_name))
 
     del pending_auth[phone]
     return {
@@ -599,8 +643,18 @@ async def search_movie(
             if msg.id > sent_msg.id and (msg.buttons or msg.text):
                 reply_msg = msg
                 break
-        if reply_msg and reply_msg.buttons:
-            break
+        if reply_msg:
+            text_lower = (reply_msg.text or "").lower()
+            if "join" in text_lower or "subscribe" in text_lower or any("join" in b.text.lower() for row in (reply_msg.buttons or []) for b in row):
+                print(f"🤖 @{MOVIE_BOT} requested channel join during search. Auto-joining channels...")
+                joined = await auto_handle_force_sub(active_cl, movie_bot_entity, reply_msg)
+                if joined:
+                    print(f"🔄 Retrying search for: {query}")
+                    sent_msg = await active_cl.send_message(movie_bot_entity, query)
+                    reply_msg = None
+                    continue
+            if reply_msg.buttons:
+                break
 
     if not reply_msg or not reply_msg.buttons:
         return {
@@ -689,16 +743,24 @@ async def tgm_resolve(
     }
 
 @app.post("/resolve")
-async def resolve_stream(req: ResolveRequest):
-    if not client or not client.is_connected():
+@app.post("/tgm/resolve")
+async def resolve_stream(req: ResolveRequest, request: Request, session: Optional[str] = Query(None)):
+    session_id = session or request.headers.get("x-telegram-session")
+    active_cl = await get_client_for_session(session_id)
+    if not active_cl or not active_cl.is_connected():
         raise HTTPException(status_code=503, detail="Telegram client is not ready.")
 
-    movie_bot_entity = await client.get_input_entity(MOVIE_BOT)
-    link_bot_entity = await client.get_input_entity(LINK_BOT)
+    cache_key = f"{req.message_id}_{req.row}_{req.col}"
+    if cache_key in tgm_resolved_cache:
+        print(f"⚡ Returning cached stream URL for {cache_key}: {tgm_resolved_cache[cache_key].get('stream_url')}")
+        return tgm_resolved_cache[cache_key]
+
+    movie_bot_entity = await active_cl.get_input_entity(MOVIE_BOT)
+    link_bot_entity = await active_cl.get_input_entity(LINK_BOT)
 
     # 1. Fetch message and click selected button
     print(f"🎯 Clicking button [{req.row}, {req.col}] on msg {req.message_id}...")
-    msg = await client.get_messages(movie_bot_entity, ids=req.message_id)
+    msg = await active_cl.get_messages(movie_bot_entity, ids=req.message_id)
     if not msg:
         raise HTTPException(status_code=404, detail="Original button message not found.")
 
@@ -711,7 +773,7 @@ async def resolve_stream(req: ResolveRequest):
         start_param = parse_qs(parsed.query).get("start", [None])[0]
         if start_param:
             print(f"📨 Sending /start {start_param} to @{MOVIE_BOT}...")
-            sent_start = await client.send_message(movie_bot_entity, f"/start {start_param}")
+            sent_start = await active_cl.send_message(movie_bot_entity, f"/start {start_param}")
             base_file_id = sent_start.id
 
     # 2. Wait for @TGM_Files_Bot to send the file message
@@ -719,10 +781,16 @@ async def resolve_stream(req: ResolveRequest):
     file_msg = None
     for _ in range(30):  # wait up to 15 seconds
         await asyncio.sleep(0.5)
-        async for m in client.iter_messages(movie_bot_entity, limit=3):
-            if m.id >= base_file_id and m.media:
-                file_msg = m
-                break
+        async for m in active_cl.iter_messages(movie_bot_entity, limit=3):
+            if m.id >= base_file_id:
+                if m.media:
+                    file_msg = m
+                    break
+                elif m.buttons:
+                    text_lower = (m.text or "").lower()
+                    if "join" in text_lower or "subscribe" in text_lower or any("join" in b.text.lower() for row in m.buttons for b in row):
+                        print("🤖 Force-sub channel join requested! Auto-joining channels...")
+                        await auto_handle_force_sub(active_cl, movie_bot_entity, m)
         if file_msg:
             break
 
@@ -732,16 +800,16 @@ async def resolve_stream(req: ResolveRequest):
     print(f"📦 Got file message {file_msg.id}! Forwarding to @{LINK_BOT}...")
 
     # 3. Forward the file message to @HyperLinkGenXBot
-    last_link_msgs = [m.id async for m in client.iter_messages(link_bot_entity, limit=1)]
+    last_link_msgs = [m.id async for m in active_cl.iter_messages(link_bot_entity, limit=1)]
     base_link_id = last_link_msgs[0] if last_link_msgs else 0
 
-    await client.forward_messages(link_bot_entity, file_msg)
+    await active_cl.forward_messages(link_bot_entity, file_msg)
 
     print(f"⏳ Waiting for stream link from @{LINK_BOT}...")
     link_reply = None
     for _ in range(40):  # wait up to 20 seconds
         await asyncio.sleep(0.5)
-        async for m in client.iter_messages(link_bot_entity, limit=3):
+        async for m in active_cl.iter_messages(link_bot_entity, limit=3):
             if m.id > base_link_id and not m.out:
                 text_lower = (m.text or "").lower()
                 if "daily limit reached" in text_lower or "exhausted your daily limit" in text_lower:
@@ -784,13 +852,15 @@ async def resolve_stream(req: ResolveRequest):
 
     print(f"✨ Successfully generated stream link: {final_stream_url}")
 
-    return {
+    res = {
         "success": True,
         "stream_url": final_stream_url,
         "download_url": download_url,
         "web_player_url": web_player_url,
         "title": req.title or "Telegram Stream",
     }
+    tgm_resolved_cache[cache_key] = res
+    return res
 
 @app.post("/resolve-token")
 async def resolve_token(req: TokenResolveRequest):
