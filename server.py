@@ -324,7 +324,7 @@ async def warmup_user_session(tg_client: TelegramClient, user_name: str = "User"
     This guarantees zero lag and no channel-join popups when the user searches for or plays a movie.
     """
     print(f"🔥 Starting background bot warm-up for user {user_name}...")
-    bots_to_start = [MOVIE_BOT, LINK_BOT, "phonofilmbot"]
+    bots_to_start = [MOVIE_BOT, LINK_BOT, "phonofilmbot", "MawaMoviesBot"]
 
     for b in bots_to_start:
         try:
@@ -846,6 +846,57 @@ async def filter_tgm(
             "quality": active_quality
         },
         "options": options
+    }
+
+@app.get("/ml/search")
+async def ml_search(query: str = Query(..., min_length=1)):
+    """
+    Source C: Searches https://www.movieloverz.in/ for movies and returns file list for @MawaMoviesBot
+    """
+    clean_q = query.strip()
+    clean_q = re.sub(r"\s*\(\d{4}\).*", "", clean_q)
+    clean_q = re.sub(r"\s+\d{4}$", "", clean_q).strip()
+
+    def fetch_ml():
+        import requests
+        import urllib.parse
+        try:
+            s_url = f"https://www.movieloverz.in/api/search?q={urllib.parse.quote(clean_q)}"
+            r1 = requests.get(s_url, timeout=8).json()
+            movies = r1.get("movies", [])
+            if not movies:
+                return []
+            m = movies[0]
+            keys = m.get("keys", [m.get("key")])
+            qs = m.get("qs", [m.get("q")])
+            m_url = "https://www.movieloverz.in/api/movie"
+            r2 = requests.post(m_url, json={"keys": keys, "qs": qs}, timeout=8).json()
+            files = r2.get("files", [])
+            results = []
+            for f in files:
+                fid = f.get("id")
+                name = f.get("name", "Video")
+                size = f.get("size", "Direct Stream")
+                if fid:
+                    results.append({
+                        "id": fid,
+                        "title": name,
+                        "size": size,
+                        "quality": extract_quality(name),
+                        "token": f"wf_{fid}",
+                        "bot": "MawaMoviesBot"
+                    })
+            return results
+        except Exception as e:
+            print(f"MovieLoverz fetch error for {clean_q}: {e}")
+            return []
+
+    files = await asyncio.to_thread(fetch_ml)
+    return {
+        "query": query,
+        "found": len(files) > 0,
+        "bot": "MawaMoviesBot",
+        "files": files
     }
 
 @app.post("/resolve")
