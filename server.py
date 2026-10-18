@@ -617,6 +617,54 @@ async def health():
         "link_bot": f"@{LINK_BOT}",
     }
 
+class TGMFilterRequest(BaseModel):
+    message_id: int
+    filter_type: str
+    filter_value: str
+
+def parse_tgm_buttons(reply_msg):
+    options = []
+    active_audio = "All"
+    active_quality = "All"
+
+    if reply_msg and reply_msg.buttons and len(reply_msg.buttons) > 0:
+        first_row = reply_msg.buttons[0]
+        for btn in first_row:
+            b_txt = btn.text.strip()
+            if "🌐" in b_txt or "audio" in b_txt.lower():
+                clean_lang = b_txt.replace("🌐", "").strip()
+                active_audio = "All" if clean_lang.lower() in ["audios", "all"] else clean_lang
+            elif "🎬" in b_txt or "resolution" in b_txt.lower():
+                clean_qual = b_txt.replace("🎬", "").strip()
+                active_quality = "All" if clean_qual.lower() in ["resolutions", "all"] else clean_qual
+
+        for r_idx, row in enumerate(reply_msg.buttons):
+            for c_idx, btn in enumerate(row):
+                btn_text = btn.text.strip()
+                btn_data = getattr(btn, "data", b"") or b""
+
+                # Ignore top menu buttons, navigation buttons, ads, trending, etc.
+                if r_idx == 0 and ("🌐" in btn_text or "🎬" in btn_text or "📺" in btn_text or "audios" in btn_text.lower() or "resolutions" in btn_text.lower()):
+                    continue
+                if any(w in btn_text.lower() for w in ["next", "back", "cancel", "close", "home", ">>", "<<", "page", "unlock premium", "trending", "send all", "🗓"]):
+                    continue
+
+                # Accept if data starts with file# OR text contains video resolution/size tags
+                is_file = btn_data.startswith(b"file#") or any(k in btn_text.lower() for k in ["gb", "mb", "1080p", "720p", "480p", "360p", "4k", "2160p", "mkv", "mp4", "bluray", "dvd", "hdrip"])
+                if is_file:
+                    options.append({
+                        "id": f"tgm_{reply_msg.id}_{r_idx}_{c_idx}",
+                        "message_id": reply_msg.id,
+                        "row": r_idx,
+                        "col": c_idx,
+                        "title": btn_text,
+                        "quality": extract_quality(btn_text),
+                        "size": extract_size(btn_text) or "Direct Stream",
+                        "audio": active_audio
+                    })
+
+    return options, active_audio, active_quality
+
 @app.get("/search")
 @app.get("/tgm/search")
 async def search_movie(
@@ -631,21 +679,20 @@ async def search_movie(
 
     movie_bot_entity = await active_cl.get_input_entity(MOVIE_BOT)
 
-    # Send search query to Movie Bot (@TGM_Files_Bot)
     print(f"🔍 [Bot 2] Searching @{MOVIE_BOT} for: {query}")
     sent_msg = await active_cl.send_message(movie_bot_entity, query)
 
-    # Wait for the bot to reply with inline buttons
     reply_msg = None
-    for _ in range(30):  # wait up to 15 seconds
+    for _ in range(30):
         await asyncio.sleep(0.5)
         async for msg in active_cl.iter_messages(movie_bot_entity, limit=5):
-            if msg.id > sent_msg.id and (msg.buttons or msg.text):
+            if msg.id > sent_msg.id and msg.buttons:
                 reply_msg = msg
                 break
         if reply_msg:
+            # Check for force-sub channel join
             text_lower = (reply_msg.text or "").lower()
-            if "join" in text_lower or "subscribe" in text_lower or any("join" in b.text.lower() for row in (reply_msg.buttons or []) for b in row):
+            if "join" in text_lower or "subscribe" in text_lower or any("join" in b.text.lower() for row in reply_msg.buttons for b in row):
                 print(f"🤖 @{MOVIE_BOT} requested channel join during search. Auto-joining channels...")
                 joined = await auto_handle_force_sub(active_cl, movie_bot_entity, reply_msg)
                 if joined:
@@ -653,93 +700,152 @@ async def search_movie(
                     sent_msg = await active_cl.send_message(movie_bot_entity, query)
                     reply_msg = None
                     continue
-            if reply_msg.buttons:
-                break
+
+            # If in a sub-menu (showing 'Back to Results'), click Back to Results first
+            for r_idx, row in enumerate(reply_msg.buttons):
+                for c_idx, b in enumerate(row):
+                    if "back to results" in b.text.lower():
+                        print("🔙 Returning from sub-menu to main files...")
+                        try:
+                            await reply_msg.click(r_idx, c_idx)
+                            await asyncio.sleep(1.2)
+                            reply_msg = await active_cl.get_messages(movie_bot_entity, ids=reply_msg.id)
+                        except Exception:
+                            pass
+                        break
+            break
 
     if not reply_msg or not reply_msg.buttons:
         return {
             "query": query,
             "found": False,
             "message": "No matching qualities or files found from Bot 2.",
-            "options": []
+            "options": [],
+            "available_filters": {
+                "audios": ["All", "Telugu", "Hindi", "English", "Tamil", "Malayalam", "Kannada", "Bhojpuri", "Marathi", "Punjabi", "Gujarati", "Bengali"],
+                "qualities": ["All", "1080p", "720p", "480p", "360p"]
+            }
         }
 
-    options = []
-    for r_idx, row in enumerate(reply_msg.buttons):
-        for c_idx, btn in enumerate(row):
-            btn_text = btn.text.strip()
-            # Ignore navigation buttons or ads
-            if any(w in btn_text.lower() for w in ["next", "back", "cancel", "close", "home", ">>", "<<", "page", "unlock premium", "audios", "resolutions", "seasons", "trending"]):
-                continue
-
-            # Only include rows that have actual movie qualities or sizes
-            if any(k in btn_text.lower() for k in ["gb", "mb", "1080p", "720p", "480p", "4k", "mkv", "mp4"]):
-                options.append({
-                    "id": f"tgm_{reply_msg.id}_{r_idx}_{c_idx}",
-                    "message_id": reply_msg.id,
-                    "row": r_idx,
-                    "col": c_idx,
-                    "title": btn_text,
-                    "quality": extract_quality(btn_text),
-                    "size": extract_size(btn_text) or "Direct Stream",
-                })
+    options, active_audio, active_quality = parse_tgm_buttons(reply_msg)
 
     return {
         "query": query,
         "found": len(options) > 0,
         "message_id": reply_msg.id,
         "options": options,
+        "active_filters": {
+            "audio": active_audio,
+            "quality": active_quality
+        },
+        "available_filters": {
+            "audios": ["All", "Telugu", "Hindi", "English", "Tamil", "Malayalam", "Kannada", "Bhojpuri", "Marathi", "Punjabi", "Gujarati", "Bengali"],
+            "qualities": ["All", "1080p", "720p", "480p", "360p"]
+        }
     }
 
-@app.post("/tgm/resolve")
-async def tgm_resolve(
-    req: ResolveRequest,
+@app.api_route("/tgm/filter", methods=["GET", "POST"])
+async def filter_tgm(
     request: Request,
-    session: Optional[str] = Query(None)
+    message_id: Optional[int] = Query(None),
+    filter_type: Optional[str] = Query(None),
+    filter_value: Optional[str] = Query(None),
+    session: Optional[str] = Query(None),
+    body: Optional[TGMFilterRequest] = None
 ):
     session_id = session or request.headers.get("x-telegram-session")
     active_cl = await get_client_for_session(session_id)
     if not active_cl or not active_cl.is_connected():
         raise HTTPException(status_code=503, detail="Telegram client is not ready.")
 
+    m_id = message_id or (body.message_id if body else None)
+    f_type = (filter_type or (body.filter_type if body else None) or "audio").lower()
+    f_val = filter_value or (body.filter_value if body else None) or "All"
+
+    if not m_id:
+        raise HTTPException(status_code=400, detail="message_id is required.")
+
     movie_bot_entity = await active_cl.get_input_entity(MOVIE_BOT)
-    msg = await active_cl.get_messages(movie_bot_entity, ids=req.message_id)
+    msg = await active_cl.get_messages(movie_bot_entity, ids=m_id)
     if not msg:
-        raise HTTPException(status_code=404, detail="Original button message not found.")
+        raise HTTPException(status_code=404, detail="Message not found.")
 
-    cb_res = await msg.click(req.row, req.col)
-    base_file_id = req.message_id
-    if cb_res and getattr(cb_res, "url", None) and "start=" in cb_res.url:
-        parsed = urlparse(cb_res.url)
-        start_param = parse_qs(parsed.query).get("start", [None])[0]
-        if start_param:
-            sent_start = await active_cl.send_message(movie_bot_entity, f"/start {start_param}")
-            base_file_id = sent_start.id
-
-    file_msg = None
-    for _ in range(30):
-        await asyncio.sleep(0.5)
-        async for m in active_cl.iter_messages(movie_bot_entity, limit=4):
-            if m.id >= base_file_id and getattr(m, "file", None) and (m.file.size or 0) > 15_000_000:
-                file_msg = m
+    # 1. If currently in a sub-menu, return to main results first
+    for r_idx, row in enumerate(msg.buttons or []):
+        for c_idx, b in enumerate(row):
+            if "back to results" in b.text.lower():
+                try:
+                    await msg.click(r_idx, c_idx)
+                    await asyncio.sleep(1.0)
+                    msg = await active_cl.get_messages(movie_bot_entity, ids=m_id)
+                except Exception:
+                    pass
                 break
-        if file_msg:
+
+    # 2. Click category menu button (Audios or Resolutions)
+    target_menu_keyword = "audio" if f_type == "audio" else "resolution"
+    menu_pos = None
+    for r_idx, row in enumerate(msg.buttons or []):
+        for c_idx, b in enumerate(row):
+            b_txt = b.text.lower()
+            if target_menu_keyword in b_txt or (f_type == "audio" and "🌐" in b.text) or (f_type == "quality" and "🎬" in b.text):
+                menu_pos = (r_idx, c_idx)
+                break
+        if menu_pos:
             break
 
-    if not file_msg:
-        raise HTTPException(status_code=504, detail="Movie file not received from Bot 2 in time.")
+    if not menu_pos:
+        raise HTTPException(status_code=400, detail=f"Menu button for {f_type} not found in message.")
 
-    host = request.headers.get("host", "127.0.0.1:5055")
-    sess_param = f"&session={session_id}" if session_id else ""
-    direct_url = f"http://{host}/stream/direct?msg_id={file_msg.id}&bot={MOVIE_BOT}{sess_param}"
+    print(f"🎯 Clicking {target_menu_keyword} menu at {menu_pos} on msg {m_id}...")
+    await msg.click(menu_pos[0], menu_pos[1])
+    await asyncio.sleep(1.2)
+    msg_menu = await active_cl.get_messages(movie_bot_entity, ids=m_id)
+
+    # 3. Click specific option button
+    opt_pos = None
+    clean_target = f_val.strip().lower()
+    for r_idx, row in enumerate(msg_menu.buttons or []):
+        for c_idx, b in enumerate(row):
+            b_text = b.text.strip().lower()
+            if clean_target in ["all", "✨ all", "🎬 all"] and ("all" in b_text or "✨" in b_text or "🎬" in b_text):
+                opt_pos = (r_idx, c_idx)
+                break
+            elif clean_target in b_text:
+                opt_pos = (r_idx, c_idx)
+                break
+        if opt_pos:
+            break
+
+    if not opt_pos:
+        print(f"⚠️ Option button '{f_val}' not found in bot menu, returning to results...")
+        for r_idx, row in enumerate(msg_menu.buttons or []):
+            for c_idx, b in enumerate(row):
+                if "back to results" in b.text.lower():
+                    await msg_menu.click(r_idx, c_idx)
+                    await asyncio.sleep(1.0)
+                    break
+        msg_result = await active_cl.get_messages(movie_bot_entity, ids=m_id)
+    else:
+        print(f"🎯 Clicking filter option '{f_val}' at {opt_pos}...")
+        await msg_menu.click(opt_pos[0], opt_pos[1])
+        await asyncio.sleep(1.5)
+        msg_result = await active_cl.get_messages(movie_bot_entity, ids=m_id)
+
+    options, active_audio, active_quality = parse_tgm_buttons(msg_result)
 
     return {
         "success": True,
-        "message_id": file_msg.id,
-        "file_name": getattr(file_msg.file, "name", req.title or "Movie"),
-        "file_size": file_msg.file.size,
-        "direct_stream_url": direct_url,
-        "stream_url": direct_url
+        "message_id": m_id,
+        "filter_applied": {
+            "type": f_type,
+            "value": f_val
+        },
+        "active_filters": {
+            "audio": active_audio,
+            "quality": active_quality
+        },
+        "options": options
     }
 
 @app.post("/resolve")
